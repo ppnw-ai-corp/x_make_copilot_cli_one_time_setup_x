@@ -10,12 +10,32 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, TextIO, cast
 
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    class _WinRegModule(Protocol):
+        HKEY_CURRENT_USER: object
+
+        def OpenKey(  # noqa: N802 - winreg API surface
+            self, key: object, sub_key: str
+        ) -> AbstractContextManager[object]: ...
+
+        def QueryValueEx(  # noqa: N802 - winreg API surface
+            self, key: object, name: str
+        ) -> tuple[object, int]: ...
+
+else:  # pragma: no cover - runtime alias for annotations
+    _WinRegModule = object
+
+winreg: _WinRegModule | None
 try:  # pragma: no cover - Windows only helper
-    import winreg  # type: ignore[import-not-found]
+    import winreg as _winreg
 except ModuleNotFoundError:  # pragma: no cover - non-Windows platforms
-    winreg = None  # type: ignore[assignment]
+    winreg = None
+else:  # pragma: no cover - import succeeds on Windows
+    winreg = cast("_WinRegModule", _winreg)
 
 
 PAT_ENV_KEYS: tuple[str, ...] = (
@@ -41,7 +61,7 @@ class ProbeResult:
     stderr: str
     timed_out: bool
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "returncode": self.returncode,
             "stdout": self.stdout,
@@ -51,17 +71,20 @@ class ProbeResult:
 
 
 def _read_user_environment_variable(name: str) -> str | None:
-    if os.name != "nt" or winreg is None:
+    if os.name != "nt":
         return None
+    if winreg is None:
+        return None
+    winreg_local = winreg
     try:  # pragma: no cover - depends on host registry
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:  # type: ignore[attr-defined]
-            value, _value_type = winreg.QueryValueEx(key, name)
+        with winreg_local.OpenKey(winreg_local.HKEY_CURRENT_USER, "Environment") as key:
+            value_obj, _value_type = winreg_local.QueryValueEx(key, name)
     except FileNotFoundError:
         return None
     except OSError:
         return None
-    if isinstance(value, str):
-        return value
+    if isinstance(value_obj, str):
+        return value_obj
     return None
 
 
@@ -119,10 +142,11 @@ def _run_probe(env: Mapping[str, str], *, timeout: float) -> ProbeResult:
     powershell = shutil.which("powershell") or "powershell"
     command = (
         "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
-        "copilot --prompt 'Copilot CLI setup probe' --allow-all-tools --stream off --no-color"
+        "copilot --prompt 'Copilot CLI setup probe' --allow-all-tools --stream off "
+        "--no-color"
     )
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - command string is static
             [powershell, "-NoProfile", "-Command", command],
             env=env,
             capture_output=True,
@@ -159,7 +183,7 @@ def _launch_interactive(env: Mapping[str, str]) -> int:
     command = (
         "Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; copilot"
     )
-    completed = subprocess.run(
+    completed = subprocess.run(  # noqa: S603 - command string is static
         [powershell, "-NoProfile", "-Command", command],
         env=env,
         check=False,
@@ -167,7 +191,9 @@ def _launch_interactive(env: Mapping[str, str]) -> int:
     return completed.returncode
 
 
-def _bool_option(payload: Mapping[str, Any], key: str, default: bool = False) -> bool:
+def _bool_option(
+    payload: Mapping[str, object], key: str, *, default: bool = False
+) -> bool:
     value = payload.get(key, default)
     if isinstance(value, bool):
         return value
@@ -186,7 +212,7 @@ class x_cls_make_copilot_cli_one_time_setup_x:  # noqa: N801 - legacy public API
     def __init__(self, ctx: object | None = None) -> None:
         self._ctx = ctx
 
-    def run(self, request: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def run(self, request: Mapping[str, object] | None = None) -> dict[str, object]:
         payload = dict(request or {})
         explicit_pat = payload.get("pat")
         pat_value = explicit_pat.strip() if isinstance(explicit_pat, str) else None
@@ -194,7 +220,10 @@ class x_cls_make_copilot_cli_one_time_setup_x:  # noqa: N801 - legacy public API
         if not pat:
             return {
                 "status": "missing_pat",
-                "message": "No Copilot Requests PAT was provided or discovered in the environment.",
+                "message": (
+                    "No Copilot Requests PAT was provided or discovered in the "
+                    "environment."
+                ),
                 "pat_present": False,
                 "pat_sources": sources,
                 "probe": None,
@@ -204,25 +233,30 @@ class x_cls_make_copilot_cli_one_time_setup_x:  # noqa: N801 - legacy public API
         if not cli_path:
             return {
                 "status": "copilot_cli_not_found",
-                "message": "GitHub Copilot CLI was not located on PATH. Install it (npm install -g @github/copilot) and retry.",
+                "message": (
+                    "GitHub Copilot CLI was not located on PATH. Install it (npm "
+                    "install -g @github/copilot) and retry."
+                ),
                 "pat_present": True,
                 "pat_sources": sources,
                 "pat_hash": _hash_token(pat),
                 "probe": None,
             }
 
-        timeout = payload.get("probe_timeout", _DEFAULT_TIMEOUT_SECONDS)
-        try:
-            timeout_value = float(timeout)
-        except (TypeError, ValueError):
-            timeout_value = _DEFAULT_TIMEOUT_SECONDS
+        timeout_obj = payload.get("probe_timeout", _DEFAULT_TIMEOUT_SECONDS)
+        timeout_value = _DEFAULT_TIMEOUT_SECONDS
+        if isinstance(timeout_obj, (int, float, str)):
+            try:
+                timeout_value = float(timeout_obj)
+            except ValueError:
+                timeout_value = _DEFAULT_TIMEOUT_SECONDS
 
         env = _build_env(pat)
         probe = _run_probe(env, timeout=timeout_value)
         stdout = probe.stdout.strip()
         stderr = probe.stderr.strip()
 
-        result: dict[str, Any] = {
+        result: dict[str, object] = {
             "status": "unknown",
             "message": "",
             "pat_present": True,
@@ -237,7 +271,10 @@ class x_cls_make_copilot_cli_one_time_setup_x:  # noqa: N801 - legacy public API
             result.update(
                 {
                     "status": "probe_timeout",
-                    "message": "Probe timed out; Copilot CLI likely awaits folder trust or /login.",
+                    "message": (
+                        "Probe timed out; Copilot CLI likely awaits folder trust "
+                        "or /login."
+                    ),
                 }
             )
             return result
@@ -253,7 +290,10 @@ class x_cls_make_copilot_cli_one_time_setup_x:  # noqa: N801 - legacy public API
             return result
 
         if probe.returncode == 0 and not stdout:
-            message = "Copilot CLI returned no output. Launch `copilot`, approve folder trust, then run `/login` once."
+            message = (
+                "Copilot CLI returned no output. Launch `copilot`, approve "
+                "folder trust, then run `/login` once."
+            )
             result.update(
                 {
                     "status": "needs_login",
@@ -281,19 +321,22 @@ class x_cls_make_copilot_cli_one_time_setup_x:  # noqa: N801 - legacy public API
         return result
 
 
-def _load_request() -> Mapping[str, Any]:
-    if sys.stdin.isatty():
-        return {}
-    raw = sys.stdin.read()
+def _load_request() -> Mapping[str, object]:
+    stdin = cast("TextIO", sys.stdin)
+    if stdin.isatty():
+        return cast("Mapping[str, object]", {})
+    raw = stdin.read()
     if not raw.strip():
-        return {}
+        return cast("Mapping[str, object]", {})
     try:
-        data = json.loads(raw)
+        data_obj: object = json.loads(raw)
     except json.JSONDecodeError as exc:  # pragma: no cover - simple pass-through
-        raise SystemExit(f"Invalid JSON input: {exc}") from exc
-    if not isinstance(data, Mapping):
-        raise SystemExit("Input JSON must describe an object.")
-    return data
+        error_message = f"Invalid JSON input: {exc}"
+        raise SystemExit(error_message) from exc
+    if not isinstance(data_obj, Mapping):
+        error_message = "Input JSON must describe an object."
+        raise SystemExit(error_message)
+    return cast("Mapping[str, object]", data_obj)
 
 
 def main() -> int:
@@ -301,16 +344,21 @@ def main() -> int:
         request = _load_request()
         result = x_cls_make_copilot_cli_one_time_setup_x().run(request)
         print(json.dumps(result, indent=2))
-        return 0 if result.get("status") != "probe_failed" else 1
+        status_value = result.get("status")
+        is_probe_failure = (
+            isinstance(status_value, str) and status_value == "probe_failed"
+        )
     except SystemExit:  # propagate explicit exits
         raise
-    except Exception as exc:  # pragma: no cover - defensive logging
+    except Exception as exc:  # pragma: no cover - defensive logging  # noqa: BLE001
         error_payload = {
             "status": "error",
             "message": str(exc),
         }
         print(json.dumps(error_payload, indent=2))
         return 1
+    else:
+        return 1 if is_probe_failure else 0
 
 
 if __name__ == "__main__":
